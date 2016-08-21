@@ -1,0 +1,7 @@
+*~
+*.swp
+
+.vs/
+packages/
+obj/
+bin/
