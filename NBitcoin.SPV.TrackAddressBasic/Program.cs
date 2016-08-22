@@ -77,18 +77,9 @@ namespace NBitcoin.SPV.TrackAddressBasic
 
             // tracker behavior tracks our address
             Console.WriteLine("Tracking {0}", key.PubKey.GetAddress(network));
-            var tracker = new Tracker();
-            tracker.Add(key.ScriptPubKey);
-            var trackerBehavior = new TrackerBehavior(tracker, chain);
-            parameters.TemplateBehaviors.Add(trackerBehavior);
-            tracker.NewOperation += (Tracker sender, Tracker.IOperation trackerOperation) =>
-            {
-                Console.WriteLine("tracker operation: {0}", trackerOperation.ToString());
-            };
+            parameters.TemplateBehaviors.Add(new TrackerBehavior(new Tracker(), chain));
 
             var node = Node.Connect(network, peer, parameters);
-            trackerBehavior.Detach();
-            trackerBehavior.Attach(node);
 
             // debug fluff
             node.MessageReceived += (node1, message) =>
@@ -110,6 +101,13 @@ namespace NBitcoin.SPV.TrackAddressBasic
             {
                 if (node1.State == NodeState.HandShaked)
                 {
+                    var trackerBehavior = node.Behaviors.Find<TrackerBehavior>();
+                    trackerBehavior.Tracker.Add(key.ScriptPubKey);
+                    trackerBehavior.Tracker.NewOperation += (Tracker sender, Tracker.IOperation trackerOperation) =>
+                    {
+                        Console.WriteLine("tracker operation: {0}", trackerOperation.ToString());
+                    };
+
                     trackerBehavior.Scan(scanLocation, DateTimeOffset.MinValue);
                     trackerBehavior.SendMessageAsync(new MempoolPayload());
 
