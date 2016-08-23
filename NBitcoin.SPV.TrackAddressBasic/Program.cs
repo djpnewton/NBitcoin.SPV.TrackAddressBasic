@@ -1,4 +1,6 @@
 ﻿using System;
+using System.IO;
+using System.Reflection;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -15,43 +17,36 @@ namespace NBitcoin.SPV.TrackAddressBasic
     {
         static Network network = Network.TestNet;
 
+        public static string ChainFile => Path.Combine(Path.GetDirectoryName(Assembly.GetEntryAssembly().Location), ChainName());
+
+        static string ChainName()
+        {
+            if (network == Network.Main)
+                return "chainmain.data";
+            return "chaintest.data";
+        }
+
         static void Main(string[] args)
         {
-            // parse key from command line
-            var key = NBitcoin.Key.Parse(args[0]);
+            // parse address from command line
+            var addr = BitcoinAddress.Create(args[0]);
 
-            // connect to local trusted node
-            var ipaddr = IPAddress.Parse("127.0.0.1");
-            var peer = new NetworkAddress(ipaddr, 18333);
+            // use local trusted node
+            NetworkAddress peer = new NetworkAddress(IPAddress.Parse("127.0.0.1"), network == Network.TestNet ? 18333 : 8333); ;
 
             // initial scan location
             var scanLocation = new BlockLocator();
             scanLocation.Blocks.Add(network.GetGenesis().GetHash());
+            var skipBefore = DateTimeOffset.MinValue;
+            //skipBefore = DateTimeOffset.Now.AddMonths(-1);
+
+            // load chain
+            var chain = new ConcurrentChain(network);
+            if (File.Exists(ChainFile))
+                chain.Load(File.ReadAllBytes(ChainFile));
 
             // connect node 
-            var chain = new ConcurrentChain(network);
-            Node node = null;
-            NodeEventHandler nodeDisconnect = null;
-            nodeDisconnect = (Node node1) =>
-            {
-                // TrackerBehavior has probably disconnected the node because of too many false positives...
-                Console.WriteLine("Disconnected!");
-
-                // save progress
-                var trackerBehavior = node1.Behaviors.Find<TrackerBehavior>();
-                scanLocation = trackerBehavior.CurrentProgress;
-
-                Task.Run(() =>
-                {
-                    System.Threading.Thread.Sleep(1000);
-
-                    // reconnect
-                    node = ConnectNode(key, peer, chain, scanLocation, nodeDisconnect);
-                    HandshakeNode(node, peer);
-                });
-            };
-            node = ConnectNode(key, peer, chain, scanLocation, nodeDisconnect);
-            HandshakeNode(node, peer);
+            ConnectNode(addr, peer, chain, scanLocation, skipBefore);
 
             int chainHeight = 0;
             while (true)
@@ -60,13 +55,17 @@ namespace NBitcoin.SPV.TrackAddressBasic
                 {
                     chainHeight = chain.Height;
                     Console.WriteLine("Chain height: {0}", chain.Height);
+                    using (var fs = File.Open(ChainFile, FileMode.Create))
+                        chain.WriteTo(fs);
                 }
                 System.Threading.Thread.Sleep(5000);
             }
         }
 
-        private static Node ConnectNode(Key key, NetworkAddress peer, ConcurrentChain chain, BlockLocator scanLocation, NodeEventHandler nodeDisconnect)
+        private static void ConnectNode(BitcoinAddress addr, NetworkAddress peer, ConcurrentChain chain, BlockLocator scanLocation, DateTimeOffset skipBefore)
         {
+            var script = addr.ScriptPubKey; // standard "pay to pubkey hash" script
+
             var parameters = new NodeConnectionParameters();
 
             // ping pong
@@ -76,54 +75,60 @@ namespace NBitcoin.SPV.TrackAddressBasic
             parameters.TemplateBehaviors.Add(new ChainBehavior(chain));
 
             // tracker behavior tracks our address
-            Console.WriteLine("Tracking {0}", key.PubKey.GetAddress(network));
             parameters.TemplateBehaviors.Add(new TrackerBehavior(new Tracker(), chain));
 
-            var node = Node.Connect(network, peer, parameters);
+            var addressManager = new AddressManager();
+            addressManager.Add(peer, IPAddress.Loopback);
 
-            // debug fluff
-            node.MessageReceived += (node1, message) =>
+            parameters.TemplateBehaviors.Add(new AddressManagerBehavior(addressManager));
+            var group = new NodesGroup(network, parameters);
+            group.AllowSameGroup = true;
+            group.MaximumNodeConnection = 1;
+            group.Requirements.SupportSPV = true;
+            group.Connect();
+            group.ConnectedNodes.Added += (s, e) =>
             {
-                if (message.Message.Command != "headers" && message.Message.Command != "merkleblock")
+                var node = e.Node;
+                node.MessageReceived += (node1, message) =>
                 {
-                    if (message.Message.Payload is TxPayload)
+                    if (message.Message.Command != "headers" && message.Message.Command != "merkleblock")
                     {
-                        var txPayload = (TxPayload)message.Message.Payload;
-                        Console.WriteLine("tx {0}", txPayload.Object.GetHash());
-                    }
+                        if (message.Message.Payload is TxPayload)
+                        {
+                            var txPayload = (TxPayload) message.Message.Payload;
+                            foreach (var output in txPayload.Object.Outputs)
+                                if (output.ScriptPubKey == script)
+                                    Console.WriteLine("tx {0}", txPayload.Object.GetHash());
+                        }
                         else
-                    Console.WriteLine(message.Message.Command);
-                }
-            };
+                            Console.WriteLine(message.Message.Command);
+                    }
+                };
 
-            // start tracker scanning
-            node.StateChanged += (node1, oldState) =>
-            {
-                if (node1.State == NodeState.HandShaked)
+                node.Disconnected += n =>
                 {
-                    var trackerBehavior = node.Behaviors.Find<TrackerBehavior>();
-                    trackerBehavior.Tracker.Add(key.ScriptPubKey);
-                    trackerBehavior.Tracker.NewOperation += (Tracker sender, Tracker.IOperation trackerOperation) =>
-                    {
-                        Console.WriteLine("tracker operation: {0}", trackerOperation.ToString());
-                    };
+                    // TrackerBehavior has probably disconnected the node because of too many false positives...
+                    Console.WriteLine("Disconnected!");
 
-                    trackerBehavior.Scan(scanLocation, DateTimeOffset.MinValue);
-                    trackerBehavior.SendMessageAsync(new MempoolPayload());
+                    // save progress
+                    var _trackerBehavior = n.Behaviors.Find<TrackerBehavior>();
+                    scanLocation = _trackerBehavior.CurrentProgress;
+                };
 
-                    trackerBehavior.RefreshBloomFilter();
-                }
+                // start tracker scanning
+                var trackerBehavior = node.Behaviors.Find<TrackerBehavior>();
+                Console.WriteLine("Tracking {0} ({1})", addr, script);
+                trackerBehavior.Tracker.Add(script);
+                trackerBehavior.Tracker.NewOperation += (Tracker sender, Tracker.IOperation trackerOperation) =>
+                {
+                    Console.WriteLine("tracker operation: {0}", trackerOperation.ToString());
+                };
+
+                trackerBehavior.Scan(scanLocation, skipBefore);
+                trackerBehavior.SendMessageAsync(new MempoolPayload());
+
+                trackerBehavior.RefreshBloomFilter();
             };
-
-            node.Disconnected += nodeDisconnect;
-
-            return node;
-        }
-
-        private static void HandshakeNode(Node node, NetworkAddress peer)
-        {
-            node.VersionHandshake();
-            Console.WriteLine("Successful handshake with {0}", peer.Endpoint);
         }
     }
 }
